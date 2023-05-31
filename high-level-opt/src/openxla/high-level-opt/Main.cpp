@@ -8,8 +8,9 @@
 #include "mhlo/transforms/passes.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllPasses.h"
-#include "openxla/high-level-opt/LayoutPipeline.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "openxla/high-level-opt/FusionPipeline.h"
+#include "openxla/high-level-opt/LayoutPipeline.h"
 #include "stablehlo/dialect/Register.h"
 
 using namespace mlir;
@@ -21,14 +22,18 @@ int main(int argc, char** argv) {
   PassPipelineRegistration<> layout_pipeline(
       "openxla-layout-pipeline",
       "Runs XLA's layout assignment on top of a stable-hlo input",
-      [](OpPassManager& pm) {
-        openxla::hlopt::buildLayoutPipeline(pm);
-      });
+      [](OpPassManager& pm) { openxla::hlopt::buildLayoutPipeline(pm); });
+
+  PassPipelineRegistration<> fusion_pipeline(
+      "openxla-fusion-pipeline",
+      "Runs XLA's fusion passes on top of a stable-hlo input",
+      [](OpPassManager& pm) { openxla::hlopt::buildFusionPipeline(pm); });
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   mhlo::registerAllMhloDialects(registry);
   stablehlo::registerAllDialects(registry);
 
-  return mlir::failed(MlirOptMain(argc, argv, "openxla high-level-opt pass driver\n", registry));
+  return mlir::failed(MlirOptMain(
+      argc, argv, "openxla high-level-opt pass driver\n", registry));
 }

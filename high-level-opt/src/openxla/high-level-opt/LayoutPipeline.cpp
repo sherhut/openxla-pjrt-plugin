@@ -6,18 +6,22 @@
 
 #include "openxla/high-level-opt/LayoutPipeline.h"
 
+#include "mhlo/IR/hlo_ops.h"
 #include "mhlo/transforms/passes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Support/LogicalResult.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/transforms/hlo_constant_splitter.h"
-#include "xla/service/flatten_call_graph.h"
 #include "xla/service/algebraic_simplifier.h"
+#include "xla/service/flatten_call_graph.h"
 #include "xla/service/gpu/gpu_layout_assignment.h"
 #include "xla/service/hlo_pass_fix.h"
 #include "xla/service/hlo_pass_pipeline.h"
 #include "xla/service/layout_normalization.h"
-#include "xla/service/reshape_decomposer.h"
 #include "xla/service/reduce_decomposer.h"
+#include "xla/service/reshape_decomposer.h"
 #include "xla/service/transpose_folding.h"
 #include "xla/translate/hlo_to_mhlo/hlo_to_mlir_hlo.h"
 #include "xla/translate/mhlo_to_hlo/mlir_hlo_to_hlo.h"
@@ -31,7 +35,7 @@ StatusOr<std::optional<HloInstruction*>> NormalizeLayoutForGpuCustomCalls(
   return {std::nullopt};
 }
 
-Status RunLayoutPipeline(HloModule *hlo_module) {
+Status RunLayoutPipeline(HloModule* hlo_module) {
   // Run layout assignment in a separate pipeline from
   // "post-layout-assignment" because we want everything after layout
   // assignment to have a layout-sensitive invariant-checker, but
@@ -46,7 +50,6 @@ Status RunLayoutPipeline(HloModule *hlo_module) {
   pipeline.AddPass<gpu::GpuLayoutAssignment>(
       hlo_module->mutable_entry_computation_layout(), /* se= */ nullptr,
       &layout_constraints);
-
 
   // The LayoutAssignment pass may leave behind kCopy instructions which are
   // duplicate or NOPs, so remove them with algebraic simplification and CSE.
@@ -78,7 +81,7 @@ Status RunLayoutPipeline(HloModule *hlo_module) {
 
 }  // namespace xla
 
-namespace openxla::hlopt {
+namespace {
 
 class RunLayoutPipelinePass
     : public PassWrapper<RunLayoutPipelinePass, OperationPass<ModuleOp>> {
@@ -86,7 +89,9 @@ class RunLayoutPipelinePass
   RunLayoutPipelinePass() {}
 
  private:
-  StringRef getArgument() const override { return "openxla-high-level-opts-layout"; }
+  StringRef getArgument() const override {
+    return "openxla-high-level-opts-layout";
+  }
   void runOnOperation() override {
     // Convert to HLO.
     xla::HloProto hlo_proto;
@@ -136,16 +141,61 @@ class RunLayoutPipelinePass
   }
 };
 
+static LogicalResult convertBitcastIntoReshape(mhlo::BitcastOp op,
+                                               PatternRewriter& rewriter) {
+  auto sourceLayout =
+      op->getAttrOfType<mlir::DenseIntElementsAttr>("source_layout");
+  auto resultLayout =
+      op->getAttrOfType<mlir::DenseIntElementsAttr>("result_layout");
+
+  auto isDefaultLayout = [](DenseIntElementsAttr attr) -> bool {
+    if (!attr) return false;
+    int max = attr.getNumElements() - 1;
+    for (auto e : attr.getValues<int64_t>()) {
+      if (e != max--) return false;
+    }
+    return true;
+  };
+  if (!isDefaultLayout(sourceLayout) || !isDefaultLayout(resultLayout))
+    return failure();
+
+  // Replace with a reshape and drop the layout.
+  rewriter.replaceOpWithNewOp<mhlo::ReshapeOp>(op, op.getType(),
+                                               op.getOperand());
+  return success();
+}
+
+class RemoveLowLevelHloOpsPass
+    : public PassWrapper<RemoveLowLevelHloOpsPass, OperationPass<ModuleOp>> {
+ public:
+  RemoveLowLevelHloOpsPass() = default;
+
+ private:
+  StringRef getArgument() const override {
+    return "openxla-high-level-opts-remove-ll-hlo";
+  }
+  void runOnOperation() override {
+    RewritePatternSet patterns(&getContext());
+    patterns.add(&convertBitcastIntoReshape);
+    if (failed(applyPatternsAndFoldGreedily(getOperation(),
+                                            std::move(patterns)))) {
+      signalPassFailure();
+    }
+  }
+};
+
+}  // anonymous namespace
+
 // Builds a pipeline which runs the XLA layout passes.
-void buildLayoutPipeline(mlir::OpPassManager &passManager) {
+void openxla::hlopt::buildLayoutPipeline(mlir::OpPassManager& passManager) {
   // To MHLO.
   passManager.addPass(mlir::mhlo::createStablehloLegalizeToHloPass());
 
   passManager.addPass(std::make_unique<RunLayoutPipelinePass>());
 
+  // Clean up the mhlo.
+  passManager.addPass(std::make_unique<RemoveLowLevelHloOpsPass>());
+
   // And back to stablehlo.
   passManager.addPass(mlir::mhlo::createHloLegalizeToStablehloPass());
 }
-
-}  // namespace openxla::hlopt
-
